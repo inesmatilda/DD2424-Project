@@ -302,6 +302,186 @@ class GapNet(nn.Module):
         return x
 
 # =============================================================================
+# THE ULTIMATE BASELINE (Best Performance & Speed)
+# =============================================================================
+
+class UltimateNet(nn.Module):
+    """Combines GAP, RegVGGBlocks (MaxPool), and eliminates massive FC layers."""
+    def __init__(self, block_dropout=0.2):
+        super(UltimateNet, self).__init__()
+        self.patchify = nn.Sequential(
+            nn.Conv2d(3, 64, kernel_size=2, stride=2, bias=False),
+            nn.BatchNorm2d(64),
+            nn.ReLU(inplace=True)
+        )
+        
+        # Standard VGG Blocks with Batch Norm and Block Dropout
+        self.block1 = RegVGGBlock(64, 64, apply_pooling=True, dropout_p=block_dropout)
+        self.block2 = RegVGGBlock(64, 128, apply_pooling=True, dropout_p=block_dropout)
+        self.block3 = RegVGGBlock(128, 256, apply_pooling=False, dropout_p=block_dropout)
+        
+        # Global Average Pooling replaces the FC layer completely
+        self.gap = nn.AdaptiveAvgPool2d((1, 1))
+        
+        # Final Classifier
+        self.classifier = nn.Linear(256, 10) 
+
+    def forward(self, x):
+        x = self.patchify(x)
+        x = self.block1(x)
+        x = self.block2(x)
+        x = self.block3(x)
+        
+        x = self.gap(x)
+        x = torch.flatten(x, 1)
+        x = self.classifier(x)
+        return x
+
+# =============================================================================
+# PART 7: A/B GRADE EXTENSIONS (Tested on the Clean Part 5 + GAP Baseline)
+# =============================================================================
+
+# --- 7a: SQUEEZE-AND-EXCITATION ---
+class SEBlock(nn.Module):
+    def __init__(self, channels, reduction=16):
+        super(SEBlock, self).__init__()
+        self.squeeze = nn.AdaptiveAvgPool2d((1, 1))
+        self.excitation = nn.Sequential(
+            nn.Linear(channels, channels // reduction, bias=False),
+            nn.ReLU(inplace=True),
+            nn.Linear(channels // reduction, channels, bias=False),
+            nn.Sigmoid() 
+        )
+
+    def forward(self, x):
+        b, c, _, _ = x.size()
+        y = self.squeeze(x).view(b, c)
+        y = self.excitation(y).view(b, c, 1, 1)
+        return x * y.expand_as(x)
+
+class SEVGGBlock(nn.Module):
+    def __init__(self, in_channels, out_channels, apply_pooling=True, dropout_p=0.0):
+        super(SEVGGBlock, self).__init__()
+        self.conv1 = nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1, bias=False)
+        self.bn1 = nn.BatchNorm2d(out_channels)
+        self.relu1 = nn.ReLU(inplace=True)
+        self.conv2 = nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1, bias=False)
+        self.bn2 = nn.BatchNorm2d(out_channels)
+        self.relu2 = nn.ReLU(inplace=True)
+        self.se = SEBlock(out_channels) # SE injected here!
+        self.apply_pooling = apply_pooling
+        if self.apply_pooling:
+            self.pool = nn.MaxPool2d(kernel_size=2, stride=2)
+        self.dropout = nn.Dropout(p=dropout_p)
+
+    def forward(self, x):
+        x = self.relu1(self.bn1(self.conv1(x)))
+        x = self.relu2(self.bn2(self.conv2(x)))
+        x = self.se(x) 
+        if self.apply_pooling:
+            x = self.pool(x)
+        return self.dropout(x)
+
+# --- 7b & 7c: CUSTOM NORMALIZATIONS ---
+class RMSNorm2d(nn.Module):
+    def __init__(self, num_features, eps=1e-8):
+        super(RMSNorm2d, self).__init__()
+        self.eps = eps
+        self.weight = nn.Parameter(torch.ones(1, num_features, 1, 1))
+
+    def forward(self, x):
+        rms = torch.sqrt(torch.mean(x ** 2, dim=(1, 2, 3), keepdim=True) + self.eps)
+        return (x / rms) * self.weight
+
+class RLayerNorm2d(nn.Module):
+    def __init__(self, num_features, eps=1e-5):
+        super(RLayerNorm2d, self).__init__()
+        self.eps = eps
+        self.weight = nn.Parameter(torch.ones(1, num_features, 1, 1))
+        self.bias = nn.Parameter(torch.zeros(1, num_features, 1, 1))
+        self.noise_threshold = nn.Parameter(torch.tensor(2.0))
+
+    def forward(self, x):
+        mean = x.mean(dim=(1, 2, 3), keepdim=True)
+        var = x.var(dim=(1, 2, 3), keepdim=True, unbiased=False)
+        x_norm = (x - mean) / torch.sqrt(var + self.eps)
+        noise_gate = torch.sigmoid(self.noise_threshold - torch.abs(x_norm))
+        x_robust = x_norm * noise_gate
+        return x_robust * self.weight + self.bias
+
+class NormVGGBlock(nn.Module):
+    """Generic block where we can pass in RMSNorm or RLayerNorm."""
+    def __init__(self, in_channels, out_channels, norm_layer, apply_pooling=True, dropout_p=0.0):
+        super(NormVGGBlock, self).__init__()
+        self.conv1 = nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1, bias=False)
+        self.norm1 = norm_layer(out_channels)
+        self.relu1 = nn.ReLU(inplace=True)
+        self.conv2 = nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1, bias=False)
+        self.norm2 = norm_layer(out_channels)
+        self.relu2 = nn.ReLU(inplace=True)
+        self.apply_pooling = apply_pooling
+        if self.apply_pooling:
+            self.pool = nn.MaxPool2d(kernel_size=2, stride=2)
+        self.dropout = nn.Dropout(p=dropout_p)
+
+    def forward(self, x):
+        x = self.relu1(self.norm1(self.conv1(x)))
+        x = self.relu2(self.norm2(self.conv2(x)))
+        if self.apply_pooling:
+            x = self.pool(x)
+        return self.dropout(x)
+
+# --- 7d: LARGE KERNEL (ConvNeXt-style) ---
+class LargeKernelVGGBlock(nn.Module):
+    def __init__(self, in_channels, out_channels, apply_pooling=True, dropout_p=0.0):
+        super(LargeKernelVGGBlock, self).__init__()
+        # 7x7 kernel with padding=3 to keep spatial dimensions identical
+        self.conv1 = nn.Conv2d(in_channels, out_channels, kernel_size=7, padding=3, bias=False)
+        self.bn1 = nn.BatchNorm2d(out_channels)
+        self.relu1 = nn.ReLU(inplace=True)
+        self.conv2 = nn.Conv2d(out_channels, out_channels, kernel_size=7, padding=3, bias=False)
+        self.bn2 = nn.BatchNorm2d(out_channels)
+        self.relu2 = nn.ReLU(inplace=True)
+        self.apply_pooling = apply_pooling
+        if self.apply_pooling:
+            self.pool = nn.MaxPool2d(kernel_size=2, stride=2)
+        self.dropout = nn.Dropout(p=dropout_p)
+
+    def forward(self, x):
+        x = self.relu1(self.bn1(self.conv1(x)))
+        x = self.relu2(self.bn2(self.conv2(x)))
+        if self.apply_pooling:
+            x = self.pool(x)
+        return self.dropout(x)
+
+# --- THE MASTER NETWORK BUILDER ---
+class ExtNet(nn.Module):
+    """A single network class where we plug in the specific block type we want to test."""
+    def __init__(self, block_class, norm_layer=None, block_dropout=0.2):
+        super(ExtNet, self).__init__()
+        self.patchify = nn.Sequential(
+            nn.Conv2d(3, 64, kernel_size=2, stride=2, bias=False),
+            norm_layer(64) if norm_layer else nn.BatchNorm2d(64),
+            nn.ReLU(inplace=True)
+        )
+        if norm_layer:
+            self.block1 = block_class(64, 64, norm_layer, apply_pooling=True, dropout_p=block_dropout)
+            self.block2 = block_class(64, 128, norm_layer, apply_pooling=True, dropout_p=block_dropout)
+            self.block3 = block_class(128, 256, norm_layer, apply_pooling=False, dropout_p=block_dropout)
+        else:
+            self.block1 = block_class(64, 64, apply_pooling=True, dropout_p=block_dropout)
+            self.block2 = block_class(64, 128, apply_pooling=True, dropout_p=block_dropout)
+            self.block3 = block_class(128, 256, apply_pooling=False, dropout_p=block_dropout)
+            
+        self.gap = nn.AdaptiveAvgPool2d((1, 1))
+        self.classifier = nn.Linear(256, 10) 
+
+    def forward(self, x):
+        x = self.block3(self.block2(self.block1(self.patchify(x))))
+        return self.classifier(torch.flatten(self.gap(x), 1))
+    
+
+# =============================================================================
 # REUSABLE TRAINING FUNCTION
 # =============================================================================
 
@@ -415,51 +595,8 @@ if __name__ == "__main__":
     print(f"Device set to: {device}")
 
     # ---------------------------------------------------------
-    # 2. RUN TESTS OF DIFFERNET NETWORKS 
+    # ADVANCED DATA SETUP (Needs to be declared before the switchboard)
     # ---------------------------------------------------------
-
-    print("\n>>> RUNNING PART 1: Assignment 3 Replication (Sanity Check)")
-    model = Assignment3ReplicationNet().to(device)
-        
-    # Using SGD and CyclicLR as requested by the assignment
-    optimizer = optim.SGD(model.parameters(), lr=0.01, weight_decay=0.003)
-    scheduler = optim.lr_scheduler.CyclicLR(
-        optimizer, base_lr=1e-5, max_lr=1e-1, step_size_up=800, mode='triangular'
-    )
-        
-    # Note: we use the loader WITHOUT augmentation for strict Assignment 3 replication
-    train_model(model, no_aug_train_loader, val_loader, optimizer, epochs=10, device=device, scheduler=scheduler)
-    
-    print("\n>>> RUNNING PART 2: First Upgrade (1 Raw VGG Block - Expect Overfitting)")
-    model = FirstUpgradeNet().to(device)
-    optimizer = optim.AdamW(model.parameters(), lr=1e-3)
-    train_model(model, no_aug_train_loader, val_loader, optimizer, epochs=25, device=device)
-
-    print("\n>>> RUNNING PART 3: Full Baseline (3 Raw VGG Blocks - Expect Heavy Overfitting)")
-    model = FullBaselineNet().to(device)
-    optimizer = optim.AdamW(model.parameters(), lr=1e-3)
-    train_model(model, no_aug_train_loader, val_loader, optimizer, epochs=25, device=device)
-
-    print("\n>>> RUNNING PART 4a: Dropout ONLY")
-    model = RegularizedNet(block_dropout=0.2, fc_dropout=0.5).to(device)
-    optimizer = optim.AdamW(model.parameters(), lr=1e-3, weight_decay=0.0) 
-    train_model(model, no_aug_train_loader, val_loader, optimizer, epochs=25, device=device)
-
-    print("\n>>> RUNNING PART 4b: L2 Regularization ONLY")
-    model = RegularizedNet(block_dropout=0.0, fc_dropout=0.0).to(device)
-    optimizer = optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-3) 
-    train_model(model, no_aug_train_loader, val_loader, optimizer, epochs=25, device=device)
-
-    print("\n>>> RUNNING PART 4c: Data Augmentation ONLY")
-    model = RegularizedNet(block_dropout=0.0, fc_dropout=0.0).to(device)
-    optimizer = optim.AdamW(model.parameters(), lr=1e-3, weight_decay=0.0)
-    train_model(model, train_loader, val_loader, optimizer, epochs=25, device=device)
-
-    print("\n>>> RUNNING PART 5: Combined Regularization (Dropout + L2 + Augmentation + BatchNorm)")
-    model = RegularizedNet(block_dropout=0.2, fc_dropout=0.5).to(device)
-    optimizer = optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-3)
-    train_model(model, train_loader, val_loader, optimizer, epochs=50, device=device)
-
     # 6a Transform (Cut-out/Random Erasing added)
     transform_6a = transforms.Compose([
         transforms.ToPILImage(),
@@ -470,57 +607,190 @@ if __name__ == "__main__":
         transforms.RandomErasing(p=0.5, scale=(0.02, 0.20)) 
     ])
     
-    # 6a DataLoader (Matches your existing loader preferences)
+    # 6a DataLoader (If you experience slowdowns on Mac, remember to add num_workers=0 here)
     loader_6a = DataLoader(CustomCIFAR10Dataset(train_data, train_labels, transform_6a), batch_size=128, shuffle=True)
 
-    print("\n>>> RUNNING PART 6a: Adv. Augmentation (Cut-out + Label Smoothing)")
-    model = RegularizedNet(block_dropout=0.2, fc_dropout=0.5).to(device)
-    optimizer = optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-3)
-        
-    # Adding Label Smoothing (10%) via the custom criterion
-    smooth_criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
-    # Make sure to pass loader_6a and our custom criterion
-    train_model(model, loader_6a, val_loader, optimizer, epochs=50, device=device, criterion=smooth_criterion)
+    # ---------------------------------------------------------
+    # SWITCHBOARD: Change EXPERIMENT_TO_RUN to test different parts
+    # Options: "1", "2", "3", "4a", "4b", "4c", "5", "6a", "6b", "6c", "6d", "ultimate"
+    # ---------------------------------------------------------
+    EXPERIMENT_TO_RUN = "8"  # Change this variable to run different experiments
 
-    print("\n>>> RUNNING PART 6b: LR Scheduler (Cosine Annealing with Warm Restarts)")
+    if EXPERIMENT_TO_RUN == "1":
+        print("\n>>> RUNNING PART 1: Assignment 3 Replication (Sanity Check)")
+        model = Assignment3ReplicationNet().to(device)
         
-    # We use the standard regularized model from Part 5
-    model = RegularizedNet(block_dropout=0.2, fc_dropout=0.5).to(device)
-        
-    # We start with a higher learning rate (5e-3 instead of 1e-3) 
-    # so the cosine curve has plenty of room to sweep downwards.
-    optimizer = optim.AdamW(model.parameters(), lr=5e-3, weight_decay=1e-3)
-        
-    # Because train_model calls scheduler.step() EVERY BATCH, 
-    # T_0 (time until the first restart) must be calculated in total batches, not epochs.
-    batches_per_epoch = len(train_loader)
-        
-    # This will drop the learning rate on a curve, and "restart" it back to 5e-3 every 10 epochs
-    restarts_scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(
-        optimizer, 
-        T_0=10 * batches_per_epoch,  
-        T_mult=1,                    # Keeps the restart interval fixed at 10 epochs
-        eta_min=1e-5                 # The lowest the learning rate will go before restarting
-    )
-        
-    #  we are passing our restarts_scheduler here
-    train_model(model, train_loader, val_loader, optimizer, epochs=50, device=device, scheduler=restarts_scheduler)
-
+        # Using SGD and CyclicLR as requested by the assignment
+        optimizer = optim.SGD(model.parameters(), lr=0.01, weight_decay=0.003)
+        scheduler = optim.lr_scheduler.CyclicLR(
+            optimizer, base_lr=1e-5, max_lr=1e-1, step_size_up=800, mode='triangular'
+        )
+        # Note: we use the loader WITHOUT augmentation for strict Assignment 3 replication
+        train_model(model, no_aug_train_loader, val_loader, optimizer, epochs=10, device=device, scheduler=scheduler)
     
-    print("\n>>> RUNNING PART 6c: Stride 2 Down-sampling (No MaxPool)")
-    # We instantiate our new StrideNet 
-    model = StrideNet(block_dropout=0.2, fc_dropout=0.5).to(device)
-    optimizer = optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-3)
-    train_model(model, train_loader, val_loader, optimizer, epochs=50, device=device)
+    elif EXPERIMENT_TO_RUN == "2":
+        print("\n>>> RUNNING PART 2: First Upgrade (1 Raw VGG Block - Expect Overfitting)")
+        model = FirstUpgradeNet().to(device)
+        optimizer = optim.AdamW(model.parameters(), lr=1e-3)
+        train_model(model, no_aug_train_loader, val_loader, optimizer, epochs=25, device=device)
 
-    print("\n>>> RUNNING PART 6d: Global Average Pooling (Replacing FC Layer)")
+    elif EXPERIMENT_TO_RUN == "3":
+        print("\n>>> RUNNING PART 3: Full Baseline (3 Raw VGG Blocks - Expect Heavy Overfitting)")
+        model = FullBaselineNet().to(device)
+        optimizer = optim.AdamW(model.parameters(), lr=1e-3)
+        train_model(model, no_aug_train_loader, val_loader, optimizer, epochs=25, device=device)
+
+    elif EXPERIMENT_TO_RUN == "4a":
+        print("\n>>> RUNNING PART 4a: Dropout ONLY")
+        model = RegularizedNet(block_dropout=0.2, fc_dropout=0.5).to(device)
+        optimizer = optim.AdamW(model.parameters(), lr=1e-3, weight_decay=0.0) 
+        train_model(model, no_aug_train_loader, val_loader, optimizer, epochs=25, device=device)
+
+    elif EXPERIMENT_TO_RUN == "4b":
+        print("\n>>> RUNNING PART 4b: L2 Regularization ONLY")
+        model = RegularizedNet(block_dropout=0.0, fc_dropout=0.0).to(device)
+        optimizer = optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-3) 
+        train_model(model, no_aug_train_loader, val_loader, optimizer, epochs=25, device=device)
+
+    elif EXPERIMENT_TO_RUN == "4c":
+        print("\n>>> RUNNING PART 4c: Data Augmentation ONLY")
+        model = RegularizedNet(block_dropout=0.0, fc_dropout=0.0).to(device)
+        optimizer = optim.AdamW(model.parameters(), lr=1e-3, weight_decay=0.0)
+        train_model(model, train_loader, val_loader, optimizer, epochs=25, device=device)
+
+    elif EXPERIMENT_TO_RUN == "5":
+        print("\n>>> RUNNING PART 5: Combined Regularization (Dropout + L2 + Augmentation + BatchNorm)")
+        model = RegularizedNet(block_dropout=0.2, fc_dropout=0.5).to(device)
+        optimizer = optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-3)
+        train_model(model, train_loader, val_loader, optimizer, epochs=50, device=device)
+
+    elif EXPERIMENT_TO_RUN == "6a":
+        print("\n>>> RUNNING PART 6a: Adv. Augmentation (Cut-out + Label Smoothing)")
+        model = RegularizedNet(block_dropout=0.2, fc_dropout=0.5).to(device)
+        optimizer = optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-3)
         
+        # Adding Label Smoothing (10%) via the custom criterion
+        smooth_criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
+        # Make sure to pass loader_6a and our custom criterion
+        train_model(model, loader_6a, val_loader, optimizer, epochs=50, device=device, criterion=smooth_criterion)
+
+    elif EXPERIMENT_TO_RUN == "6b":
+        print("\n>>> RUNNING PART 6b: LR Scheduler (Cosine Annealing with Warm Restarts)")
+        # We use the standard regularized model from Part 5
+        model = RegularizedNet(block_dropout=0.2, fc_dropout=0.5).to(device)
+        # We start with a higher learning rate (5e-3 instead of 1e-3) 
+        optimizer = optim.AdamW(model.parameters(), lr=5e-3, weight_decay=1e-3)
+        
+        # Because train_model calls scheduler.step() EVERY BATCH, T_0 must be calculated in total batches
+        batches_per_epoch = len(train_loader)
+        restarts_scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(
+            optimizer, 
+            T_0=10 * batches_per_epoch,  
+            T_mult=1,                    # Keeps the restart interval fixed at 10 epochs
+            eta_min=1e-5                 # The lowest the learning rate will go before restarting
+        )
+        # passing our restarts_scheduler here
+        train_model(model, train_loader, val_loader, optimizer, epochs=50, device=device, scheduler=restarts_scheduler)
+
+    elif EXPERIMENT_TO_RUN == "6c":
+        print("\n>>> RUNNING PART 6c: Stride 2 Down-sampling (No MaxPool)")
+        # We instantiate our new StrideNet 
+        model = StrideNet(block_dropout=0.2, fc_dropout=0.5).to(device)
+        optimizer = optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-3)
+        train_model(model, train_loader, val_loader, optimizer, epochs=50, device=device)
+
+    elif EXPERIMENT_TO_RUN == "6d":
+        print("\n>>> RUNNING PART 6d: Global Average Pooling (Replacing FC Layer)")
         # Instantiate the GAP network. Notice we don't have an fc_dropout parameter anymore!
-    model = GapNet(block_dropout=0.2).to(device)
-        
-    optimizer = optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-3)
-        
-    # Train using the standard augmented train_loader
-    train_model(model, train_loader, val_loader, optimizer, epochs=50, device=device)
+        model = GapNet(block_dropout=0.2).to(device)
+        optimizer = optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-3)
+        # Train using the standard augmented train_loader
+        train_model(model, train_loader, val_loader, optimizer, epochs=50, device=device)
 
-    
+    elif EXPERIMENT_TO_RUN == "ultimate":
+        print("\n>>> RUNNING THE ULTIMATE BASELINE (GAP + Cosine Annealing + Adv. Augmentation)")
+        # Instantiate our fastest, leanest model
+        model = UltimateNet(block_dropout=0.2).to(device)
+        # Start with a high learning rate (5e-3) for Cosine Annealing to sweep down from
+        optimizer = optim.AdamW(model.parameters(), lr=5e-3, weight_decay=1e-3)
+        
+        # 1. Cosine Annealing Scheduler (Restart every 10 epochs)
+        batches_per_epoch = len(loader_6a)
+        restarts_scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(
+            optimizer, 
+            T_0=10 * batches_per_epoch,  
+            T_mult=1,                    
+            eta_min=1e-5                 
+        )
+        
+        # 2. Label Smoothing (10%)
+        smooth_criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
+        
+        # 3. Train using the Cut-out dataloader (loader_6a)
+        train_model(
+            model, 
+            loader_6a, 
+            val_loader, 
+            optimizer, 
+            epochs=50, 
+            device=device, 
+            scheduler=restarts_scheduler,
+            criterion=smooth_criterion
+        )
+
+    elif EXPERIMENT_TO_RUN == "7a":
+        print("\n>>> RUNNING PART 7a: SE Blocks (Attention Ablation)")
+        model = ExtNet(block_class=SEVGGBlock, block_dropout=0.2).to(device)
+        optimizer = optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-3)
+        train_model(model, train_loader, val_loader, optimizer, epochs=50, device=device)
+
+    elif EXPERIMENT_TO_RUN == "7b":
+        print("\n>>> RUNNING PART 7b: RMSNorm (Speed Ablation)")
+        model = ExtNet(block_class=NormVGGBlock, norm_layer=RMSNorm2d, block_dropout=0.2).to(device)
+        optimizer = optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-3)
+        train_model(model, train_loader, val_loader, optimizer, epochs=50, device=device)
+
+    elif EXPERIMENT_TO_RUN == "7c":
+        print("\n>>> RUNNING PART 7c: R-LayerNorm (Noise/Stability Ablation)")
+        model = ExtNet(block_class=NormVGGBlock, norm_layer=RLayerNorm2d, block_dropout=0.2).to(device)
+        optimizer = optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-3)
+        train_model(model, train_loader, val_loader, optimizer, epochs=50, device=device)
+
+    elif EXPERIMENT_TO_RUN == "7d":
+        print("\n>>> RUNNING PART 7d: Large 7x7 Kernels (ConvNeXt Spatial Ablation)")
+        model = ExtNet(block_class=LargeKernelVGGBlock, block_dropout=0.2).to(device)
+        optimizer = optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-3)
+        train_model(model, train_loader, val_loader, optimizer, epochs=50, device=device)
+
+    elif EXPERIMENT_TO_RUN == "8":
+        print("\n>>> RUNNING PART 8: The Final SOTA Model (SE-Net + Ultimate Training)")
+        
+        # 1. The Winning Architecture: GAP Baseline + Squeeze-and-Excitation
+        model = ExtNet(block_class=SEVGGBlock, block_dropout=0.2).to(device)
+        
+        # 2. The Winning Optimizer: AdamW (starting at a high 5e-3 for the scheduler)
+        optimizer = optim.AdamW(model.parameters(), lr=5e-3, weight_decay=1e-3)
+        
+        # 3. The Winning Scheduler: Cosine Annealing with Warm Restarts
+        batches_per_epoch = len(loader_6a)
+        restarts_scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(
+            optimizer, 
+            T_0=10 * batches_per_epoch,  
+            T_mult=1,                    
+            eta_min=1e-5                 
+        )
+        
+        # 4. The Winning Loss Function: CrossEntropy with Label Smoothing
+        smooth_criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
+        
+        # 5. The Winning Data: The loader with Cut-out / Random Erasing
+        train_model(
+            model, 
+            loader_6a, 
+            val_loader, 
+            optimizer, 
+            epochs=50, 
+            device=device, 
+            scheduler=restarts_scheduler,
+            criterion=smooth_criterion
+        )
