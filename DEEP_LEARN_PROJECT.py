@@ -70,7 +70,7 @@ class Assignment3ReplicationNet(nn.Module):
         return x
 
 # =============================================================================
-# PARTS 2 & 3: THE "RAW" BASELINE 
+# PARTS 2 & 3: THE BASELINE 
 # =============================================================================
 
 class RawVGGBlock(nn.Module):
@@ -143,7 +143,7 @@ class FullBaselineNet(nn.Module):
         return x
 
 # =============================================================================
-# PART 4 & 5: VERSATILE REGULARIZED ARCHITECTURE
+# PART 4 & 5: REGULARIZED ARCHITECTURE
 # =============================================================================
 
 class RegVGGBlock(nn.Module):
@@ -242,7 +242,7 @@ class StrideNet(nn.Module):
         # Block 1 and 2 perform down-sampling (stride=2)
         self.block1 = StrideVGGBlock(64, 64, downsample=True, dropout_p=block_dropout)
         self.block2 = StrideVGGBlock(64, 128, downsample=True, dropout_p=block_dropout)
-        # Block 3 does NOT down-sample, as requested by the assignment
+        # Block 3 does not down-sample
         self.block3 = StrideVGGBlock(128, 256, downsample=False, dropout_p=block_dropout)
         
         self.fc = nn.Sequential(
@@ -454,7 +454,7 @@ class LargeKernelVGGBlock(nn.Module):
             x = self.pool(x)
         return self.dropout(x)
 
-# --- THE MASTER NETWORK BUILDER ---
+# --- NETWORK BUILDER ---
 class ExtNet(nn.Module):
     """A single network class where we plug in the specific block type we want to test."""
     def __init__(self, block_class, norm_layer=None, block_dropout=0.2):
@@ -565,7 +565,7 @@ if __name__ == "__main__":
     
     train_mean, train_std = calculate_mean_std(train_data)
     
-    # Transforms WITH Augmentation (Flips & Shifts)
+    # Transforms with Augmentation (Flips & Shifts)
     train_transform = transforms.Compose([
         transforms.ToPILImage(),
         transforms.RandomCrop(32, padding=4),
@@ -574,7 +574,7 @@ if __name__ == "__main__":
         transforms.Normalize(train_mean, train_std)
     ])
     
-    # Transforms WITHOUT Augmentation (Raw Images)
+    # Transforms without Augmentation (Raw Images)
     eval_transform = transforms.Compose([
         transforms.ToPILImage(),
         transforms.ToTensor(),
@@ -589,14 +589,11 @@ if __name__ == "__main__":
     if torch.cuda.is_available():
         device = torch.device("cuda")
     elif torch.backends.mps.is_available():
-        device = torch.device("mps") # <--- This uses the Apple Silicon GPU!
+        device = torch.device("mps") # Apple Silicon GPU
     else:
         device = torch.device("cpu")
     print(f"Device set to: {device}")
 
-    # ---------------------------------------------------------
-    # ADVANCED DATA SETUP (Needs to be declared before the switchboard)
-    # ---------------------------------------------------------
     # 6a Transform (Cut-out/Random Erasing added)
     transform_6a = transforms.Compose([
         transforms.ToPILImage(),
@@ -607,12 +604,11 @@ if __name__ == "__main__":
         transforms.RandomErasing(p=0.5, scale=(0.02, 0.20)) 
     ])
     
-    # 6a DataLoader (If you experience slowdowns on Mac, remember to add num_workers=0 here)
+    # 6a DataLoader 
     loader_6a = DataLoader(CustomCIFAR10Dataset(train_data, train_labels, transform_6a), batch_size=128, shuffle=True)
 
     # ---------------------------------------------------------
     # SWITCHBOARD: Change EXPERIMENT_TO_RUN to test different parts
-    # Options: "1", "2", "3", "4a", "4b", "4c", "5", "6a", "6b", "6c", "6d", "ultimate"
     # ---------------------------------------------------------
     EXPERIMENT_TO_RUN = "8"  # Change this variable to run different experiments
 
@@ -620,12 +616,11 @@ if __name__ == "__main__":
         print("\n>>> RUNNING PART 1: Assignment 3 Replication (Sanity Check)")
         model = Assignment3ReplicationNet().to(device)
         
-        # Using SGD and CyclicLR as requested by the assignment
+        # Using SGD and CyclicLR 
         optimizer = optim.SGD(model.parameters(), lr=0.01, weight_decay=0.003)
         scheduler = optim.lr_scheduler.CyclicLR(
             optimizer, base_lr=1e-5, max_lr=1e-1, step_size_up=800, mode='triangular'
         )
-        # Note: we use the loader WITHOUT augmentation for strict Assignment 3 replication
         train_model(model, no_aug_train_loader, val_loader, optimizer, epochs=10, device=device, scheduler=scheduler)
     
     elif EXPERIMENT_TO_RUN == "2":
